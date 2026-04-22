@@ -5,7 +5,7 @@
 const crypto = require('crypto');
 
 // ─── Конфіг ───────────────────────────────────────────────────────────────────
-const PIXEL_ID    = process.env.CATDOG_FB_PIXEL_ID;
+const PIXEL_ID     = process.env.CATDOG_FB_PIXEL_ID;
 const ACCESS_TOKEN = process.env.CATDOG_FB_TOKEN;
 const FB_API_VERSION = 'v19.0';
 
@@ -49,7 +49,7 @@ function verifyShopifyWebhook(rawBody, signature) {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
   if (!secret) {
     console.warn('⚠️  SHOPIFY_WEBHOOK_SECRET not set — skipping verification');
-    return true; // вимкни це у продакшені!
+    return true;
   }
   const hash = crypto
     .createHmac('sha256', secret)
@@ -69,18 +69,23 @@ function verifyShopifyWebhook(rawBody, signature) {
 function buildUserData(order, attrs) {
   const ud = {};
 
-  if (order.email)                         ud.em = [sha256(order.email)];
-  if (order.phone)                         ud.ph = [sha256(order.phone.replace(/\D/g, ''))];
-  if (order.billing_address?.first_name)   ud.fn = [sha256(order.billing_address.first_name)];
-  if (order.billing_address?.last_name)    ud.ln = [sha256(order.billing_address.last_name)];
-  if (order.billing_address?.city)         ud.ct = [sha256(order.billing_address.city)];
-  if (order.billing_address?.country_code) {
+  if (order.email)
+    ud.em = [sha256(order.email)];
+  if (order.phone)
+    ud.ph = [sha256(order.phone.replace(/\D/g, ''))];
+  if (order.billing_address?.first_name)
+    ud.fn = [sha256(order.billing_address.first_name)];
+  if (order.billing_address?.last_name)
+    ud.ln = [sha256(order.billing_address.last_name)];
+  if (order.billing_address?.city)
+    ud.ct = [sha256(order.billing_address.city)];
+  if (order.billing_address?.country_code)
     ud.country = [sha256(order.billing_address.country_code.toLowerCase())];
-  }
-  if (order.browser_ip)                    ud.client_ip_address = order.browser_ip;
-  if (order.client_details?.user_agent)    ud.client_user_agent = order.client_details.user_agent;
+  if (order.browser_ip)
+    ud.client_ip_address = order.browser_ip;
+  if (order.client_details?.user_agent)
+    ud.client_user_agent = order.client_details.user_agent;
 
-  // fbc / fbp з note_attributes (передаються з браузерного пікселя)
   if (attrs._fbc) ud.fbc = attrs._fbc;
   if (attrs._fbp) ud.fbp = attrs._fbp;
 
@@ -89,8 +94,9 @@ function buildUserData(order, attrs) {
 
 // ─── Відправка одного CAPI-евента ─────────────────────────────────────────────
 async function sendCAPIEvent({ eventName, items, order, userData, eventId }) {
-  const currency = order.currency || 'UAH';
-  const value    = round2(items.reduce((s, i) => s + i.price * i.quantity, 0));
+  const value = round2(
+    items.reduce((sum, i) => sum + i.price * i.quantity, 0)
+  );
 
   const payload = {
     data: [{
@@ -100,7 +106,7 @@ async function sendCAPIEvent({ eventName, items, order, userData, eventId }) {
       action_source: 'website',
       user_data:     userData,
       custom_data: {
-        currency,
+        currency:     order.currency || 'PLN',
         value,
         order_id:     String(order.id),
         num_items:    items.reduce((s, i) => s + i.quantity, 0),
@@ -115,7 +121,6 @@ async function sendCAPIEvent({ eventName, items, order, userData, eventId }) {
     }],
   };
 
-  // Тестовий код — видали після тестування
   if (process.env.FB_TEST_EVENT_CODE) {
     payload.test_event_code = process.env.FB_TEST_EVENT_CODE;
   }
@@ -148,11 +153,11 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: 'Pixel config missing' });
   }
 
-  const rawBody  = await getRawBody(req);
+  const rawBody   = await getRawBody(req);
   const signature = req.headers['x-shopify-hmac-sha256'];
 
   if (!signature || !verifyShopifyWebhook(rawBody, signature)) {
-    console.error('❌ Invalid webhook signature');
+    console.error('❌ Invalid signature');
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
@@ -163,9 +168,20 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: 'Invalid JSON' });
   }
 
-  // Збираємо note_attributes у зручний об'єкт
+  // note_attributes → зручний об'єкт
   const attrs = {};
   (order.note_attributes || []).forEach(a => { attrs[a.name] = a.value; });
+
+  // ── DEBUG: дивимось що реально приходить у line_items ──
+  console.log('🔍 line_items raw:', JSON.stringify(
+    (order.line_items || []).map(li => ({
+      product_id:   li.product_id,
+      title:        li.title,
+      vendor:       li.vendor,
+      product_type: li.product_type,
+      sku:          li.sku,
+    }))
+  ));
 
   // Маппимо line_items
   const items = (order.line_items || []).map(li => ({
@@ -173,13 +189,13 @@ module.exports = async (req, res) => {
     variant_id:   li.variant_id,
     quantity:     Number(li.quantity || 0),
     price:        Number(li.price || 0),
-    product_type: li.product_type || '',  // ← береться з поля Product type
+    product_type: li.product_type || '',
   }));
 
   const catItems = items.filter(i => isType(i.product_type, CAT_TYPE));
   const dogItems = items.filter(i => isType(i.product_type, DOG_TYPE));
 
-  console.log(`📦 Order ${order.id} — cats: ${catItems.length}, dogs: ${dogItems.length}`);
+  console.log(`📦 Order ${order.id} | cats: ${catItems.length} | dogs: ${dogItems.length}`);
 
   if (!catItems.length && !dogItems.length) {
     console.warn('⚠️  No cat/dog items in order', order.id);
@@ -189,7 +205,6 @@ module.exports = async (req, res) => {
   const userData = buildUserData(order, attrs);
   const results  = {};
 
-  // ── DogPurchase ──
   if (dogItems.length) {
     try {
       results.dog = await sendCAPIEvent({
@@ -199,14 +214,13 @@ module.exports = async (req, res) => {
         userData,
         eventId:   `${order.id}-dog`,
       });
-      console.log(`✅ DogPurchase sent for order ${order.id}`);
+      console.log(`✅ DogPurchase → order ${order.id}`);
     } catch (err) {
-      console.error(`❌ DogPurchase failed:`, err.message);
+      console.error('❌ DogPurchase error:', err.message);
       results.dogError = err.message;
     }
   }
 
-  // ── CatPurchase ──
   if (catItems.length) {
     try {
       results.cat = await sendCAPIEvent({
@@ -216,9 +230,9 @@ module.exports = async (req, res) => {
         userData,
         eventId:   `${order.id}-cat`,
       });
-      console.log(`✅ CatPurchase sent for order ${order.id}`);
+      console.log(`✅ CatPurchase → order ${order.id}`);
     } catch (err) {
-      console.error(`❌ CatPurchase failed:`, err.message);
+      console.error('❌ CatPurchase error:', err.message);
       results.catError = err.message;
     }
   }
