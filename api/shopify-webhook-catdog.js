@@ -1,13 +1,21 @@
 // api/shopify-webhook-catdog.js
 // Vercel Serverless Function
-// Shopify orders/paid → Facebook CAPI → CatPurchase / DogPurchase
+// Shopify orders/paid → Shopify Admin API (product_type) → Facebook CAPI → CatPurchase / DogPurchase
 
 const crypto = require('crypto');
 
 // ─── Конфіг ───────────────────────────────────────────────────────────────────
-const PIXEL_ID     = process.env.CATDOG_FB_PIXEL_ID;
-const ACCESS_TOKEN = process.env.CATDOG_FB_TOKEN;
-const FB_API_VERSION = 'v19.0';
+const PIXEL_ID        = process.env.CATDOG_FB_PIXEL_ID;
+const ACCESS_TOKEN    = process.env.CATDOG_FB_TOKEN;
+const FB_API_VERSION  = 'v19.0';
+
+// Shopify Admin API
+// Додай у Vercel env:
+//   SHOPIFY_STORE_DOMAIN  = yourstore.myshopify.com
+//   SHOPIFY_ADMIN_TOKEN   = shpat_xxxxxxxxxxxx
+const SHOPIFY_DOMAIN      = process.env.SHOPIFY_STORE_DOMAIN;
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+const SHOPIFY_API_VERSION = '2024-04';
 
 const CAT_TYPE = 'cat';
 const DOG_TYPE = 'dog';
@@ -15,10 +23,7 @@ const DOG_TYPE = 'dog';
 // ─── Utils ────────────────────────────────────────────────────────────────────
 function sha256(value) {
   if (!value) return undefined;
-  return crypto
-    .createHash('sha256')
-    .update(String(value).trim().toLowerCase())
-    .digest('hex');
+  return crypto.createHash('sha256').update(String(value).trim().toLowerCase()).digest('hex');
 }
 
 function normalizeType(type) {
@@ -39,7 +44,7 @@ async function getRawBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
     req.on('data', chunk => (data += chunk));
-    req.on('end', () => resolve(data));
+    req.on('end',  () => resolve(data));
     req.on('error', reject);
   });
 }
@@ -51,40 +56,79 @@ function verifyShopifyWebhook(rawBody, signature) {
     console.warn('⚠️  SHOPIFY_WEBHOOK_SECRET not set — skipping verification');
     return true;
   }
-  const hash = crypto
-    .createHmac('sha256', secret)
-    .update(rawBody, 'utf8')
-    .digest('base64');
+  const hash = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('base64');
   try {
-    return crypto.timingSafeEqual(
-      Buffer.from(hash),
-      Buffer.from(signature)
-    );
+    return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(signature));
   } catch {
     return false;
   }
+}
+
+// ─── Shopify Admin API: отримати product_type для масиву product_id ───────────
+// Робимо один запит через GraphQL щоб не спамити REST на кожен продукт
+async function fetchProductTypes(productIds) {
+  // productIds — масив чисел або рядків
+  const uniqueIds = [...new Set(productIds.map(String).filter(Boolean))];
+  if (!uniqueIds.length) return {};
+
+  // GraphQL: отримуємо id + productType для кожного
+  const ids = uniqueIds.map(id => `"gid://shopify/Product/${id}"`).join(', ');
+  const query = `
+    {
+      nodes(ids: [${ids}]) {
+        ... on Product {
+          id
+          productType
+        }
+      }
+    }
+  `;
+
+  const url = `https://${SHOPIFY_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type':              'application/json',
+      'X-Shopify-Access-Token':    SHOPIFY_ADMIN_TOKEN,
+    },
+    body: JSON.stringify({ query }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Shopify Admin API error ${res.status}: ${text}`);
+  }
+
+  const json = await res.json();
+  const nodes = json?.data?.nodes || [];
+
+  // Повертаємо { "productId": "productType", ... }
+  const map = {};
+  for (const node of nodes) {
+    if (!node || !node.id) continue;
+    // "gid://shopify/Product/123456789" → "123456789"
+    const numId = node.id.replace('gid://shopify/Product/', '');
+    map[numId] = node.productType || '';
+  }
+
+  console.log('🏷️  Product type map:', JSON.stringify(map));
+  return map;
 }
 
 // ─── Збираємо userData з замовлення ──────────────────────────────────────────
 function buildUserData(order, attrs) {
   const ud = {};
 
-  if (order.email)
-    ud.em = [sha256(order.email)];
-  if (order.phone)
-    ud.ph = [sha256(order.phone.replace(/\D/g, ''))];
-  if (order.billing_address?.first_name)
-    ud.fn = [sha256(order.billing_address.first_name)];
-  if (order.billing_address?.last_name)
-    ud.ln = [sha256(order.billing_address.last_name)];
-  if (order.billing_address?.city)
-    ud.ct = [sha256(order.billing_address.city)];
+  if (order.email)                        ud.em      = [sha256(order.email)];
+  if (order.phone)                        ud.ph      = [sha256(order.phone.replace(/\D/g, ''))];
+  if (order.billing_address?.first_name)  ud.fn      = [sha256(order.billing_address.first_name)];
+  if (order.billing_address?.last_name)   ud.ln      = [sha256(order.billing_address.last_name)];
+  if (order.billing_address?.city)        ud.ct      = [sha256(order.billing_address.city)];
   if (order.billing_address?.country_code)
     ud.country = [sha256(order.billing_address.country_code.toLowerCase())];
-  if (order.browser_ip)
-    ud.client_ip_address = order.browser_ip;
-  if (order.client_details?.user_agent)
-    ud.client_user_agent = order.client_details.user_agent;
+  if (order.browser_ip)                   ud.client_ip_address = order.browser_ip;
+  if (order.client_details?.user_agent)   ud.client_user_agent = order.client_details.user_agent;
 
   if (attrs._fbc) ud.fbc = attrs._fbc;
   if (attrs._fbp) ud.fbp = attrs._fbp;
@@ -94,9 +138,7 @@ function buildUserData(order, attrs) {
 
 // ─── Відправка одного CAPI-евента ─────────────────────────────────────────────
 async function sendCAPIEvent({ eventName, items, order, userData, eventId }) {
-  const value = round2(
-    items.reduce((sum, i) => sum + i.price * i.quantity, 0)
-  );
+  const value = round2(items.reduce((sum, i) => sum + i.price * i.quantity, 0));
 
   const payload = {
     data: [{
@@ -134,7 +176,6 @@ async function sendCAPIEvent({ eventName, items, order, userData, eventId }) {
   });
 
   const result = await res.json();
-
   if (!res.ok || result.error) {
     throw new Error(JSON.stringify(result.error || result));
   }
@@ -153,6 +194,12 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: 'Pixel config missing' });
   }
 
+  if (!SHOPIFY_DOMAIN || !SHOPIFY_ADMIN_TOKEN) {
+    console.error('❌ Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN');
+    return res.status(500).json({ error: 'Shopify Admin API config missing' });
+  }
+
+  // ── Raw body + верифікація ──
   const rawBody   = await getRawBody(req);
   const signature = req.headers['x-shopify-hmac-sha256'];
 
@@ -172,24 +219,36 @@ module.exports = async (req, res) => {
   const attrs = {};
   (order.note_attributes || []).forEach(a => { attrs[a.name] = a.value; });
 
-  // ── DEBUG: дивимось що реально приходить у line_items ──
-  console.log('🔍 line_items raw:', JSON.stringify(
-    (order.line_items || []).map(li => ({
+  // ── Базові line_items з вебхука ──
+  const lineItems = order.line_items || [];
+
+  console.log('🔍 line_items from webhook:', JSON.stringify(
+    lineItems.map(li => ({
       product_id:   li.product_id,
       title:        li.title,
-      vendor:       li.vendor,
-      product_type: li.product_type,
-      sku:          li.sku,
+      product_type: li.product_type, // часто порожнє у вебхуку
     }))
   ));
 
-  // Маппимо line_items
-  const items = (order.line_items || []).map(li => ({
+  // ── Дотягуємо product_type через Admin API ──
+  const productIds   = lineItems.map(li => li.product_id).filter(Boolean);
+  let productTypeMap = {};
+
+  try {
+    productTypeMap = await fetchProductTypes(productIds);
+  } catch (err) {
+    console.error('❌ Failed to fetch product types from Shopify Admin API:', err.message);
+    // Не зупиняємо — падаємо далі, items просто не потраплять у cat/dog
+  }
+
+  // ── Маппимо items, підставляємо product_type з Admin API ──
+  const items = lineItems.map(li => ({
     product_id:   li.product_id,
     variant_id:   li.variant_id,
     quantity:     Number(li.quantity || 0),
-    price:        Number(li.price || 0),
-    product_type: li.product_type || '',
+    price:        Number(li.price    || 0),
+    // Пріоритет: Admin API > webhook field
+    product_type: productTypeMap[String(li.product_id)] || li.product_type || '',
   }));
 
   const catItems = items.filter(i => isType(i.product_type, CAT_TYPE));
