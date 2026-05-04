@@ -1,45 +1,48 @@
 // api/shopify-webhook-catdog.js
-// Vercel Serverless Function
-// Shopify orders/paid → Shopify Admin API (product_type) → Facebook CAPI → CatPurchase / DogPurchase
+// Vercel Serverless Function: Shopify orders/paid → Shopify Admin API → Facebook CAPI → CatPurchase / DogPurchase
 
 const crypto = require('crypto');
 
-// ─── Конфіг ───────────────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 const PIXEL_ID        = process.env.CATDOG_FB_PIXEL_ID;
 const ACCESS_TOKEN    = process.env.CATDOG_FB_TOKEN;
-const FB_API_VERSION  = 'v19.0';
+const FB_API_VERSION  = 'v22.0';
 
-// Shopify Admin API
-// Додай у Vercel env:
-//   SHOPIFY_STORE_DOMAIN  = yourstore.myshopify.com
-//   SHOPIFY_ADMIN_TOKEN   = shpat_xxxxxxxxxxxx
+// Vercel env: SHOPIFY_STORE_DOMAIN = yourstore.myshopify.com, SHOPIFY_ADMIN_TOKEN = shpat_xxx
 const SHOPIFY_DOMAIN      = process.env.SHOPIFY_STORE_DOMAIN;
 const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const SHOPIFY_API_VERSION = '2024-04';
 
+// Must match product_type values in Shopify
 const CAT_TYPE = 'cat';
 const DOG_TYPE = 'dog';
 
 // ─── Utils ────────────────────────────────────────────────────────────────────
+
+// SHA-256 hash — required for all PII fields sent to Meta CAPI
 function sha256(value) {
   if (!value) return undefined;
   return crypto.createHash('sha256').update(String(value).trim().toLowerCase()).digest('hex');
 }
 
+// Normalize product type to lowercase for reliable comparison
 function normalizeType(type) {
   if (!type) return '';
   return String(type).toLowerCase().trim();
 }
 
+// Check if product type contains target keyword (e.g. "cat", "dog")
 function isType(type, target) {
   return normalizeType(type).includes(target);
 }
 
+// Round to 2 decimal places for price/value fields
 function round2(n) {
   return Math.round((Number(n) || 0) * 100) / 100;
 }
 
-// ─── Raw body для верифікації підпису ─────────────────────────────────────────
+// ─── Raw body reader ──────────────────────────────────────────────────────────
+// Must read raw body before parsing — needed for HMAC signature verification
 async function getRawBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
@@ -49,7 +52,8 @@ async function getRawBody(req) {
   });
 }
 
-// ─── Верифікація Shopify webhook ──────────────────────────────────────────────
+// ─── Shopify webhook signature verification ───────────────────────────────────
+// Validates request came from Shopify using HMAC-SHA256 + SHOPIFY_WEBHOOK_SECRET env var
 function verifyShopifyWebhook(rawBody, signature) {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
   if (!secret) {
@@ -64,14 +68,12 @@ function verifyShopifyWebhook(rawBody, signature) {
   }
 }
 
-// ─── Shopify Admin API: отримати product_type для масиву product_id ───────────
-// Робимо один запит через GraphQL щоб не спамити REST на кожен продукт
+// ─── Shopify Admin API: fetch product_type for a list of product IDs ──────────
+// Single GraphQL request instead of multiple REST calls — webhook line_items often have empty product_type
 async function fetchProductTypes(productIds) {
-  // productIds — масив чисел або рядків
   const uniqueIds = [...new Set(productIds.map(String).filter(Boolean))];
   if (!uniqueIds.length) return {};
 
-  // GraphQL: отримуємо id + productType для кожного
   const ids = uniqueIds.map(id => `"gid://shopify/Product/${id}"`).join(', ');
   const query = `
     {
@@ -89,8 +91,8 @@ async function fetchProductTypes(productIds) {
   const res = await fetch(url, {
     method: 'POST',
     headers: {
-      'Content-Type':              'application/json',
-      'X-Shopify-Access-Token':    SHOPIFY_ADMIN_TOKEN,
+      'Content-Type':           'application/json',
+      'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
     },
     body: JSON.stringify({ query }),
   });
@@ -103,11 +105,10 @@ async function fetchProductTypes(productIds) {
   const json = await res.json();
   const nodes = json?.data?.nodes || [];
 
-  // Повертаємо { "productId": "productType", ... }
+  // Returns { "numericProductId": "productType" } — strips GID prefix
   const map = {};
   for (const node of nodes) {
     if (!node || !node.id) continue;
-    // "gid://shopify/Product/123456789" → "123456789"
     const numId = node.id.replace('gid://shopify/Product/', '');
     map[numId] = node.productType || '';
   }
@@ -116,27 +117,50 @@ async function fetchProductTypes(productIds) {
   return map;
 }
 
-// ─── Збираємо userData з замовлення ──────────────────────────────────────────
+// ─── Extract fbc (Facebook Click ID) ─────────────────────────────────────────
+// Priority: note_attributes._fbc (written by theme) → fbclid param from landing_site URL
+function extractFbc(order, attrs) {
+  if (attrs._fbc) return attrs._fbc;
+
+  const landingSite = order.landing_site || '';
+  try {
+    const url = new URL(landingSite, 'https://placeholder.com');
+    const fbclid = url.searchParams.get('fbclid');
+    if (fbclid) {
+      // Meta fbc format: fb.{version}.{timestamp}.{fbclid}
+      const ts = Math.floor(new Date(order.created_at).getTime() / 1000);
+      return `fb.1.${ts}.${fbclid}`;
+    }
+  } catch {}
+
+  return null;
+}
+
+// ─── Build user_data payload for Meta CAPI ────────────────────────────────────
+// More fields = higher Event Match Quality (EMQ) score in Meta Events Manager
 function buildUserData(order, attrs) {
   const ud = {};
 
-  if (order.email)                        ud.em      = [sha256(order.email)];
-  if (order.phone)                        ud.ph      = [sha256(order.phone.replace(/\D/g, ''))];
-  if (order.billing_address?.first_name)  ud.fn      = [sha256(order.billing_address.first_name)];
-  if (order.billing_address?.last_name)   ud.ln      = [sha256(order.billing_address.last_name)];
-  if (order.billing_address?.city)        ud.ct      = [sha256(order.billing_address.city)];
+  if (order.email)                         ud.em      = [sha256(order.email)];
+  if (order.phone)                         ud.ph      = [sha256(order.phone.replace(/\D/g, ''))];
+  if (order.billing_address?.first_name)   ud.fn      = [sha256(order.billing_address.first_name)];
+  if (order.billing_address?.last_name)    ud.ln      = [sha256(order.billing_address.last_name)];
+  if (order.billing_address?.city)         ud.ct      = [sha256(order.billing_address.city)];
+  if (order.billing_address?.zip)          ud.zp      = [sha256(order.billing_address.zip)];
   if (order.billing_address?.country_code)
     ud.country = [sha256(order.billing_address.country_code.toLowerCase())];
-  if (order.browser_ip)                   ud.client_ip_address = order.browser_ip;
-  if (order.client_details?.user_agent)   ud.client_user_agent = order.client_details.user_agent;
+  if (order.browser_ip)                    ud.client_ip_address = order.browser_ip;
+  if (order.client_details?.user_agent)    ud.client_user_agent = order.client_details.user_agent;
 
-  if (attrs._fbc) ud.fbc = attrs._fbc;
-  if (attrs._fbp) ud.fbp = attrs._fbp;
+  const fbc = extractFbc(order, attrs);
+  const fbp = attrs._fbp || null;
+  if (fbc) ud.fbc = fbc;
+  if (fbp) ud.fbp = fbp;
 
   return ud;
 }
 
-// ─── Відправка одного CAPI-евента ─────────────────────────────────────────────
+// ─── Send a single CAPI event to Meta ────────────────────────────────────────
 async function sendCAPIEvent({ eventName, items, order, userData, eventId }) {
   const value = round2(items.reduce((sum, i) => sum + i.price * i.quantity, 0));
 
@@ -183,7 +207,7 @@ async function sendCAPIEvent({ eventName, items, order, userData, eventId }) {
   return result;
 }
 
-// ─── Головний обробник ────────────────────────────────────────────────────────
+// ─── Main handler ─────────────────────────────────────────────────────────────
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -199,7 +223,6 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: 'Shopify Admin API config missing' });
   }
 
-  // ── Raw body + верифікація ──
   const rawBody   = await getRawBody(req);
   const signature = req.headers['x-shopify-hmac-sha256'];
 
@@ -215,22 +238,21 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: 'Invalid JSON' });
   }
 
-  // note_attributes → зручний об'єкт
+  // Parse note_attributes into a flat key-value object
   const attrs = {};
   (order.note_attributes || []).forEach(a => { attrs[a.name] = a.value; });
 
-  // ── Базові line_items з вебхука ──
   const lineItems = order.line_items || [];
 
   console.log('🔍 line_items from webhook:', JSON.stringify(
     lineItems.map(li => ({
       product_id:   li.product_id,
       title:        li.title,
-      product_type: li.product_type, // часто порожнє у вебхуку
+      product_type: li.product_type,
     }))
   ));
 
-  // ── Дотягуємо product_type через Admin API ──
+  // Fetch product_type from Admin API — more reliable than webhook payload
   const productIds   = lineItems.map(li => li.product_id).filter(Boolean);
   let productTypeMap = {};
 
@@ -238,16 +260,14 @@ module.exports = async (req, res) => {
     productTypeMap = await fetchProductTypes(productIds);
   } catch (err) {
     console.error('❌ Failed to fetch product types from Shopify Admin API:', err.message);
-    // Не зупиняємо — падаємо далі, items просто не потраплять у cat/dog
   }
 
-  // ── Маппимо items, підставляємо product_type з Admin API ──
+  // Admin API product_type takes priority over webhook field
   const items = lineItems.map(li => ({
     product_id:   li.product_id,
     variant_id:   li.variant_id,
     quantity:     Number(li.quantity || 0),
     price:        Number(li.price    || 0),
-    // Пріоритет: Admin API > webhook field
     product_type: productTypeMap[String(li.product_id)] || li.product_type || '',
   }));
 
@@ -299,6 +319,7 @@ module.exports = async (req, res) => {
   return res.status(200).json({ success: true, orderId: order.id, results });
 };
 
+// Disable Vercel body parser — raw body needed for Shopify HMAC verification
 module.exports.config = {
   api: { bodyParser: false },
 };
