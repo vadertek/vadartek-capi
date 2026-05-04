@@ -141,8 +141,13 @@ function extractFbc(order, attrs) {
 function buildUserData(order, attrs) {
   const ud = {};
 
+  const phone = order.phone
+    || order.shipping_address?.phone
+    || order.billing_address?.phone
+    || null;
+
   if (order.email)                         ud.em      = [sha256(order.email)];
-  if (order.phone)                         ud.ph      = [sha256(order.phone.replace(/\D/g, ''))];
+  if (phone)                               ud.ph      = [sha256(phone.replace(/\D/g, ''))];
   if (order.billing_address?.first_name)   ud.fn      = [sha256(order.billing_address.first_name)];
   if (order.billing_address?.last_name)    ud.ln      = [sha256(order.billing_address.last_name)];
   if (order.billing_address?.city)         ud.ct      = [sha256(order.billing_address.city)];
