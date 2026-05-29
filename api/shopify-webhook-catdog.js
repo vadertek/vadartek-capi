@@ -22,7 +22,10 @@ const DOG_TYPE = 'dog';
 // SHA-256 hash — required for all PII fields sent to Meta CAPI
 function sha256(value) {
   if (!value) return undefined;
-  return crypto.createHash('sha256').update(String(value).trim().toLowerCase()).digest('hex');
+  return crypto
+    .createHash('sha256')
+    .update(String(value).trim().toLowerCase())
+    .digest('hex');
 }
 
 // Normalize product type to lowercase for reliable comparison
@@ -41,13 +44,35 @@ function round2(n) {
   return Math.round((Number(n) || 0) * 100) / 100;
 }
 
+// Calculate real line total with quantity and Shopify line discounts
+function getLineTotal(li) {
+  const qty = Number(li.quantity || 0);
+  const unitPrice = Number(li.price || 0);
+
+  const gross = unitPrice * qty;
+
+  const discounts = (li.discount_allocations || []).reduce(
+    (sum, d) => sum + Number(d.amount || 0),
+    0
+  );
+
+  return round2(Math.max(gross - discounts, 0));
+}
+
 // ─── Raw body reader ──────────────────────────────────────────────────────────
 // Must read raw body before parsing — needed for HMAC signature verification
 async function getRawBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
-    req.on('data', chunk => (data += chunk));
-    req.on('end',  () => resolve(data));
+
+    req.on('data', chunk => {
+      data += chunk;
+    });
+
+    req.on('end', () => {
+      resolve(data);
+    });
+
     req.on('error', reject);
   });
 }
@@ -58,7 +83,7 @@ function verifyShopifyWebhook(rawBody, signature) {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
 
   if (!secret) {
-    console.warn('⚠️  SHOPIFY_WEBHOOK_SECRET not set — skipping verification');
+    console.warn('⚠️ SHOPIFY_WEBHOOK_SECRET not set — skipping verification');
     return true;
   }
 
@@ -115,7 +140,7 @@ async function fetchProductTypes(productIds) {
     throw new Error(`Shopify Admin API error ${res.status}: ${text}`);
   }
 
-  const json  = await res.json();
+  const json = await res.json();
   const nodes = json?.data?.nodes || [];
 
   // Returns { "numericProductId": "productType" }
@@ -129,7 +154,7 @@ async function fetchProductTypes(productIds) {
     map[numId] = node.productType || '';
   }
 
-  console.log('🏷️  Product type map:', JSON.stringify(map));
+  console.log('🏷️ Product type map:', JSON.stringify(map));
 
   return map;
 }
@@ -167,34 +192,43 @@ function buildUserData(order, attrs) {
     order.billing_address?.phone ||
     null;
 
-  if (order.email)
+  if (order.email) {
     ud.em = [sha256(order.email)];
+  }
 
-  if (phone)
+  if (phone) {
     ud.ph = [sha256(phone.replace(/\D/g, ''))];
+  }
 
-  if (order.billing_address?.first_name)
+  if (order.billing_address?.first_name) {
     ud.fn = [sha256(order.billing_address.first_name)];
+  }
 
-  if (order.billing_address?.last_name)
+  if (order.billing_address?.last_name) {
     ud.ln = [sha256(order.billing_address.last_name)];
+  }
 
-  if (order.billing_address?.city)
+  if (order.billing_address?.city) {
     ud.ct = [sha256(order.billing_address.city)];
+  }
 
-  if (order.billing_address?.zip)
+  if (order.billing_address?.zip) {
     ud.zp = [sha256(order.billing_address.zip)];
+  }
 
-  if (order.billing_address?.country_code)
+  if (order.billing_address?.country_code) {
     ud.country = [
       sha256(order.billing_address.country_code.toLowerCase())
     ];
+  }
 
-  if (order.browser_ip)
+  if (order.browser_ip) {
     ud.client_ip_address = order.browser_ip;
+  }
 
-  if (order.client_details?.user_agent)
+  if (order.client_details?.user_agent) {
     ud.client_user_agent = order.client_details.user_agent;
+  }
 
   const fbc = extractFbc(order, attrs);
   const fbp = attrs._fbp || null;
@@ -214,7 +248,7 @@ async function sendCAPIEvent({
   eventId,
 }) {
   const value = round2(
-    items.reduce((sum, i) => sum + i.price * i.quantity, 0)
+    items.reduce((sum, i) => sum + Number(i.line_total || 0), 0)
   );
 
   // ─── FIX FOR OLD ORDERS (>7 DAYS) ──────────────────────────────────────────
@@ -247,12 +281,12 @@ async function sendCAPIEvent({
       user_data:     userData,
 
       custom_data: {
-        currency:     order.currency || 'PLN',
+        currency: order.currency || 'PLN',
         value,
-        order_id:     String(order.id),
+        order_id: String(order.id),
 
         num_items: items.reduce(
-          (s, i) => s + i.quantity,
+          (s, i) => s + Number(i.quantity || 0),
           0
         ),
 
@@ -264,12 +298,19 @@ async function sendCAPIEvent({
 
         contents: items.map(i => ({
           id:         String(i.product_id),
-          quantity:   i.quantity,
-          item_price: round2(i.price),
+          quantity:   Number(i.quantity || 0),
+          item_price: round2(i.unit_price),
         })),
       },
     }],
   };
+
+  // Useful logs for checking if Meta receives different prices
+  console.log(`${eventName} value:`, value);
+  console.log(
+    `${eventName} contents:`,
+    JSON.stringify(payload.data[0].custom_data.contents)
+  );
 
   if (process.env.FB_TEST_EVENT_CODE) {
     payload.test_event_code =
@@ -326,7 +367,7 @@ module.exports = async (req, res) => {
       .json({ error: 'Shopify Admin API config missing' });
   }
 
-  const rawBody   = await getRawBody(req);
+  const rawBody = await getRawBody(req);
   const signature = req.headers['x-shopify-hmac-sha256'];
 
   if (!signature || !verifyShopifyWebhook(rawBody, signature)) {
@@ -363,6 +404,9 @@ module.exports = async (req, res) => {
         product_id:   li.product_id,
         title:        li.title,
         product_type: li.product_type,
+        quantity:     li.quantity,
+        price:        li.price,
+        line_total:   getLineTotal(li),
       }))
     )
   );
@@ -388,7 +432,12 @@ module.exports = async (req, res) => {
     product_id: li.product_id,
     variant_id: li.variant_id,
     quantity:   Number(li.quantity || 0),
-    price:      Number(li.price || 0),
+
+    // Unit price from Shopify
+    unit_price: Number(li.price || 0),
+
+    // Real line total: unit price * quantity - discounts
+    line_total: getLineTotal(li),
 
     product_type:
       productTypeMap[String(li.product_id)] ||
@@ -408,9 +457,19 @@ module.exports = async (req, res) => {
     `📦 Order ${order.id} | cats: ${catItems.length} | dogs: ${dogItems.length}`
   );
 
+  console.log(
+    '🐶 Dog items:',
+    JSON.stringify(dogItems)
+  );
+
+  console.log(
+    '🐱 Cat items:',
+    JSON.stringify(catItems)
+  );
+
   if (!catItems.length && !dogItems.length) {
     console.warn(
-      '⚠️  No cat/dog items in order',
+      '⚠️ No cat/dog items in order',
       order.id
     );
 
