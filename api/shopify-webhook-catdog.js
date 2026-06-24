@@ -1,3 +1,4 @@
+```js
 // api/shopify-webhook-catdog.js
 // Vercel Serverless Function: Shopify orders/paid → Shopify Admin API → Facebook CAPI → CatPurchase / DogPurchase
 
@@ -22,6 +23,7 @@ const DOG_TYPE = 'dog';
 // SHA-256 hash — required for all PII fields sent to Meta CAPI
 function sha256(value) {
   if (!value) return undefined;
+
   return crypto
     .createHash('sha256')
     .update(String(value).trim().toLowerCase())
@@ -31,6 +33,7 @@ function sha256(value) {
 // Normalize product type to lowercase for reliable comparison
 function normalizeType(type) {
   if (!type) return '';
+
   return String(type).toLowerCase().trim();
 }
 
@@ -143,6 +146,11 @@ async function fetchProductTypes(productIds) {
   const json = await res.json();
   const nodes = json?.data?.nodes || [];
 
+  console.log(
+    '🛒 Shopify GraphQL raw response:',
+    JSON.stringify(nodes, null, 2)
+  );
+
   // Returns { "numericProductId": "productType" }
   const map = {};
 
@@ -154,7 +162,18 @@ async function fetchProductTypes(productIds) {
     map[numId] = node.productType || '';
   }
 
-  console.log('🏷️ Product type map:', JSON.stringify(map));
+  for (const pid of uniqueIds) {
+    if (!(pid in map)) {
+      console.warn(
+        `⚠️ Product ${pid} missing in Shopify GraphQL response`
+      );
+    }
+  }
+
+  console.log(
+    '🏷️ Product type map:',
+    JSON.stringify(map, null, 2)
+  );
 
   return map;
 }
@@ -307,6 +326,7 @@ async function sendCAPIEvent({
 
   // Useful logs for checking if Meta receives different prices
   console.log(`${eventName} value:`, value);
+
   console.log(
     `${eventName} contents:`,
     JSON.stringify(payload.data[0].custom_data.contents)
@@ -320,6 +340,24 @@ async function sendCAPIEvent({
   const url =
     `https://graph.facebook.com/${FB_API_VERSION}/${PIXEL_ID}/events?access_token=${ACCESS_TOKEN}`;
 
+  // ─── Meta diagnostics before sending ────────────────────────────────────────
+  console.log(`🆔 Meta event_id: ${eventId}`);
+
+  console.log(
+    `${eventName} product_ids:`,
+    items.map(i => i.product_id)
+  );
+
+  console.log(
+    `${eventName} variant_ids:`,
+    items.map(i => i.variant_id)
+  );
+
+  console.log(
+    `🚀 ${eventName} payload:`,
+    JSON.stringify(payload, null, 2)
+  );
+
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -329,6 +367,11 @@ async function sendCAPIEvent({
   });
 
   const result = await res.json();
+
+  console.log(
+    `📨 Meta response (${eventName}):`,
+    JSON.stringify(result, null, 2)
+  );
 
   if (!res.ok || result.error) {
     throw new Error(
@@ -402,12 +445,15 @@ module.exports = async (req, res) => {
     JSON.stringify(
       lineItems.map(li => ({
         product_id:   li.product_id,
+        variant_id:   li.variant_id,
         title:        li.title,
         product_type: li.product_type,
         quantity:     li.quantity,
         price:        li.price,
         line_total:   getLineTotal(li),
-      }))
+      })),
+      null,
+      2
     )
   );
 
@@ -428,22 +474,43 @@ module.exports = async (req, res) => {
   }
 
   // Admin API product_type takes priority
-  const items = lineItems.map(li => ({
-    product_id: li.product_id,
-    variant_id: li.variant_id,
-    quantity:   Number(li.quantity || 0),
-
-    // Unit price from Shopify
-    unit_price: Number(li.price || 0),
-
-    // Real line total: unit price * quantity - discounts
-    line_total: getLineTotal(li),
-
-    product_type:
+  const items = lineItems.map(li => {
+    const productType =
       productTypeMap[String(li.product_id)] ||
       li.product_type ||
-      '',
-  }));
+      '';
+
+    if (!productType) {
+      console.warn(
+        `⚠️ Missing product type | product=${li.product_id} variant=${li.variant_id} title="${li.title}"`
+      );
+    }
+
+    return {
+      product_id: li.product_id,
+      variant_id: li.variant_id,
+      quantity: Number(li.quantity || 0),
+
+      // Unit price from Shopify
+      unit_price: Number(li.price || 0),
+
+      // Real line total: unit price * quantity - discounts
+      line_total: getLineTotal(li),
+
+      product_type: productType,
+    };
+  });
+
+  console.log(
+    '🔎 FINAL ITEMS:',
+    JSON.stringify(items, null, 2)
+  );
+
+  items.forEach(item => {
+    console.log(
+      `📦 product=${item.product_id} variant=${item.variant_id} type="${item.product_type}" qty=${item.quantity}`
+    );
+  });
 
   const catItems = items.filter(i =>
     isType(i.product_type, CAT_TYPE)
@@ -459,18 +526,22 @@ module.exports = async (req, res) => {
 
   console.log(
     '🐶 Dog items:',
-    JSON.stringify(dogItems)
+    JSON.stringify(dogItems, null, 2)
   );
 
   console.log(
     '🐱 Cat items:',
-    JSON.stringify(catItems)
+    JSON.stringify(catItems, null, 2)
   );
 
   if (!catItems.length && !dogItems.length) {
     console.warn(
-      '⚠️ No cat/dog items in order',
-      order.id
+      `⚠️ No cat/dog items in order ${order.id}`
+    );
+
+    console.warn(
+      '⚠️ ALL ITEMS:',
+      JSON.stringify(items, null, 2)
     );
 
     return res.status(200).json({
@@ -544,3 +615,4 @@ module.exports.config = {
     bodyParser: false,
   },
 };
+```
